@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from typing import List, Optional
 import tempfile
 import os
+import json
 from bson import ObjectId
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -21,16 +22,49 @@ embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 @router.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    access_level: AccessLevelEnum = Form(AccessLevelEnum.PUBLIC),
+    allowed_roles: Optional[str] = Form(None), # JSON string or comma-separated list of allowed tenant roles
+    access_level: Optional[str] = Form(None),  # Backward compatibility parameter
     target_org_id: Optional[str] = Form(None),
     # Only Org Admins and Super Admins can upload documents
     user_payload: dict = Depends(require_role([RoleEnum.ORG_ADMIN, RoleEnum.SUPER_ADMIN]))
 ):
     user_role = user_payload.get("role")
-    if user_role == RoleEnum.SUPER_ADMIN and target_org_id and target_org_id not in ("default", "all"):
+    if user_role == RoleEnum.SUPER_ADMIN and target_org_id and target_org_id not in ("default", "all", "", "null"):
         org_id = target_org_id
     else:
         org_id = user_payload["org_id"]
+
+    # Parse allowed_roles list
+    allowed_roles_list = []
+    if allowed_roles:
+        try:
+            parsed = json.loads(allowed_roles)
+            if isinstance(parsed, list):
+                allowed_roles_list = [str(r).strip().lower() for r in parsed if str(r).strip()]
+            elif isinstance(parsed, str):
+                allowed_roles_list = [r.strip().lower() for r in parsed.split(",") if r.strip()]
+        except Exception:
+            allowed_roles_list = [r.strip().lower() for r in allowed_roles.split(",") if r.strip()]
+
+    # If no allowed_roles were specified or list was empty, deduce from access_level or organization roles
+    if not allowed_roles_list:
+        if access_level == "private":
+            allowed_roles_list = ["org_admin"]
+        else:
+            try:
+                org = await db.organizations.find_one({"_id": ObjectId(org_id)})
+                if org and org.get("roles"):
+                    allowed_roles_list = [r.strip().lower() for r in org["roles"] if r.strip()]
+            except Exception:
+                pass
+            if not allowed_roles_list:
+                allowed_roles_list = ["org_admin", "end_user"]
+
+    # Deduplicate while preserving order
+    seen = set()
+    allowed_roles_list = [r for r in allowed_roles_list if not (r in seen or seen.add(r))]
+
+    effective_access_level = "private" if (len(allowed_roles_list) == 1 and allowed_roles_list[0] == "org_admin") else "public"
     
     # Save the uploaded file temporarily to process it
     content = await file.read()
@@ -62,7 +96,8 @@ async def upload_document(
         for chunk in chunks:
             chunk.metadata = {
                 "source": file.filename,
-                "access_level": access_level.value,
+                "access_level": effective_access_level,
+                "allowed_roles": allowed_roles_list,
                 "organization_id": org_id,
                 "uploaded_by": user_payload["sub"]
             }
@@ -85,7 +120,8 @@ async def upload_document(
             organization_id=org_id,
             uploaded_by=user_payload["sub"],
             uploaded_by_email=user_payload.get("email", ""),
-            access_level=access_level,
+            access_level=effective_access_level,
+            allowed_roles=allowed_roles_list,
             pinecone_namespace=org_id,
             chunk_count=len(chunks),
             file_size=file_size,
@@ -96,7 +132,8 @@ async def upload_document(
             "message": f"Successfully ingested {file.filename}", 
             "chunks_created": len(chunks),
             "namespace": org_id,
-            "access_level": access_level.value,
+            "access_level": effective_access_level,
+            "allowed_roles": allowed_roles_list,
             "file_size": file_size,
         }
         
@@ -110,18 +147,28 @@ async def list_documents(
     organization_id: Optional[str] = None,
     user_payload: dict = Depends(get_current_user_payload)
 ):
-    """List documents. Super Admins see all documents across all tenants (or filter by org). Org Admins & End Users see only their own organization's docs."""
-    user_role = user_payload.get("role")
+    """
+    List documents.
+    - Super Admins see all documents across all tenants (or filter by org).
+    - Org Admins see all documents within their organization.
+    - End users / custom roles see ONLY documents permitted for their specific assigned role.
+    """
+    user_role = user_payload.get("role", "end_user")
     user_org_id = user_payload.get("org_id")
     
     query = {}
     if user_role == RoleEnum.SUPER_ADMIN:
         if organization_id and organization_id not in ("all", "", "[object Object]", "undefined", "null"):
             query["organization_id"] = organization_id
-    else:
+    elif user_role == RoleEnum.ORG_ADMIN:
         query["organization_id"] = user_org_id
-        if user_role == RoleEnum.END_USER:
-            query["access_level"] = "public"
+    else:
+        # Tenant member with specific role: only documents where their role is allowed
+        query["organization_id"] = user_org_id
+        query["$or"] = [
+            {"allowed_roles": {"$in": [user_role]}},
+            {"allowed_roles": {"$exists": False}, "access_level": "public"}
+        ]
     
     cursor = db.documents.find(query).sort("created_at", -1)
     documents = await cursor.to_list(length=500)
@@ -140,6 +187,9 @@ async def list_documents(
         else:
             doc["organization_name"] = "Platform Central"
             doc["organization_domain"] = ""
+            
+        if not doc.get("allowed_roles"):
+            doc["allowed_roles"] = ["org_admin"] if doc.get("access_level") == "private" else ["org_admin", "end_user"]
             
     return documents
 

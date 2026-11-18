@@ -59,6 +59,50 @@ export default function CentralAdmin() {
   const [targetRole, setTargetRole] = useState('end_user');
   const [targetPassword, setTargetPassword] = useState('');
   const [isSubmittingUser, setIsSubmittingUser] = useState(false);
+  const [orgRoles, setOrgRoles] = useState(['org_admin', 'end_user']);
+  const [isAddingCustomRole, setIsAddingCustomRole] = useState(false);
+  const [customRoleInput, setCustomRoleInput] = useState('');
+  const [isCreatingRole, setIsCreatingRole] = useState(false);
+
+  // Fetch available roles for a specific tenant organization
+  const fetchRolesForOrg = async (orgId) => {
+    if (!orgId) return;
+    try {
+      const res = await api.get(`/admin/organizations/${orgId}/roles`);
+      if (res.data?.roles && Array.isArray(res.data.roles) && res.data.roles.length > 0) {
+        setOrgRoles(res.data.roles);
+        if (!res.data.roles.includes(targetRole) && targetRole !== 'super_admin') {
+          setTargetRole(res.data.roles[0]);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load org roles:', err);
+    }
+  };
+
+  const handleTargetOrgChange = (orgId) => {
+    setTargetOrgId(orgId);
+    fetchRolesForOrg(orgId);
+  };
+
+  const handleCreateCustomRole = async () => {
+    const clean = customRoleInput.trim().toLowerCase().replace(/\s+/g, '_');
+    if (!clean || clean.length < 2) return;
+    setIsCreatingRole(true);
+    try {
+      const res = await api.post(`/admin/organizations/${targetOrgId}/roles`, { role_name: clean });
+      if (res.data?.roles) {
+        setOrgRoles(res.data.roles);
+        setTargetRole(clean);
+      }
+      setCustomRoleInput('');
+      setIsAddingCustomRole(false);
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to add role to organization');
+    } finally {
+      setIsCreatingRole(false);
+    }
+  };
 
   // Load all platform data
   const fetchData = async () => {
@@ -74,7 +118,9 @@ export default function CentralAdmin() {
       setOrganizations(orgsRes.data);
       setUsers(usersRes.data);
       if (orgsRes.data.length > 0 && !targetOrgId) {
-        setTargetOrgId(orgsRes.data[0]._id);
+        const initialOrgId = orgsRes.data[0]._id;
+        setTargetOrgId(initialOrgId);
+        fetchRolesForOrg(initialOrgId);
       }
     } catch (err) {
       setError(err.response?.data?.detail || 'Failed to load Central Admin data.');
@@ -815,7 +861,7 @@ INSTRUCTIONS FOR CLIENT:
                         </td>
                         <td style={{ padding: '14px 18px' }}>
                           <span className={`badge-pill ${isSuper ? 'badge-indigo' : isOrgAdmin ? 'badge-cyan' : 'badge-emerald'}`} style={{ fontSize: '11px' }}>
-                            {isSuper ? 'Super Admin' : isOrgAdmin ? 'Org Admin' : 'End User'}
+                            {u.role ? u.role.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : 'End User'}
                           </span>
                         </td>
                         <td style={{ padding: '14px 18px' }}>
@@ -1039,14 +1085,12 @@ INSTRUCTIONS FOR CLIENT:
                 <select
                   required
                   value={targetOrgId}
-                  onChange={e => setTargetOrgId(e.target.value)}
+                  onChange={e => handleTargetOrgChange(e.target.value)}
+                  className="input-field"
                   style={{
                     width: '100%',
                     padding: '11px 14px',
                     borderRadius: '10px',
-                    background: 'var(--input-bg)',
-                    border: '1px solid var(--input-border)',
-                    color: 'var(--color-text-primary)',
                     fontSize: '13px'
                   }}>
                   {organizations.map(o => (
@@ -1067,37 +1111,73 @@ INSTRUCTIONS FOR CLIENT:
                   value={targetEmail}
                   onChange={e => setTargetEmail(e.target.value)}
                   placeholder="e.g. employee@acme.com"
+                  className="input-field"
                   style={{
                     width: '100%',
                     padding: '11px 14px',
                     borderRadius: '10px',
-                    background: 'var(--input-bg)',
-                    border: '1px solid var(--input-border)',
-                    color: 'var(--color-text-primary)',
                     fontSize: '13px'
                   }}
                 />
               </div>
 
               <div>
-                <label style={{ display: 'block', fontSize: '12px', fontWeight: 650, color: 'var(--color-text-secondary)', marginBottom: '6px' }}>
-                  User Role
-                </label>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                  <label style={{ fontSize: '12px', fontWeight: 650, color: 'var(--color-text-secondary)' }}>
+                    Assigned Role for Organization
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setIsAddingCustomRole(!isAddingCustomRole)}
+                    style={{ background: 'none', border: 'none', color: 'var(--color-cyan)', fontSize: '11.5px', fontWeight: 650, cursor: 'pointer' }}>
+                    {isAddingCustomRole ? '✕ Cancel' : '+ Add Role to Org'}
+                  </button>
+                </div>
+
+                {isAddingCustomRole && (
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                    <input
+                      type="text"
+                      placeholder="e.g. researcher, accountant, dean, ta"
+                      value={customRoleInput}
+                      onChange={e => setCustomRoleInput(e.target.value)}
+                      className="input-field"
+                      style={{ flex: 1, padding: '8px 12px', fontSize: '12.5px', borderRadius: '8px' }}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleCreateCustomRole}
+                      disabled={isCreatingRole || !customRoleInput.trim()}
+                      className="btn-primary"
+                      style={{ padding: '6px 14px', fontSize: '12px', borderRadius: '8px' }}>
+                      {isCreatingRole ? 'Saving...' : 'Add'}
+                    </button>
+                  </div>
+                )}
+
                 <select
                   value={targetRole}
                   onChange={e => setTargetRole(e.target.value)}
+                  className="input-field"
                   style={{
                     width: '100%',
                     padding: '11px 14px',
                     borderRadius: '10px',
-                    background: 'var(--input-bg)',
-                    border: '1px solid var(--input-border)',
-                    color: 'var(--color-text-primary)',
-                    fontSize: '13px'
+                    fontSize: '13px',
+                    cursor: 'pointer'
                   }}>
-                  <option value="end_user">End User (Can chat with Public & Authorized docs)</option>
-                  <option value="org_admin">Organization Admin (Can ingest docs & manage team)</option>
-                  <option value="super_admin">Central Super Admin (Platform Owner)</option>
+                  <optgroup label="Organization Roles (Dynamically Configured)">
+                    {orgRoles.map(r => (
+                      <option key={r} value={r}>
+                        {r === 'org_admin' ? 'Organization Admin (Tenant & Document Admin)' :
+                         r === 'end_user' ? 'End User (Standard Access)' :
+                         `${r.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())} (Role-Restricted Knowledge Access)`}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Central System Platform">
+                    <option value="super_admin">Central Super Admin (Full Platform Owner)</option>
+                  </optgroup>
                 </select>
               </div>
 

@@ -158,29 +158,50 @@ async def chat_with_agent_stream(
     query_text = request.query.strip()
     query_lower = query_text.lower()
 
-    # --- STRICT ACCESS CONTROL & RELEVANCE ENFORCEMENT ---
-    # 1. Fetch private documents registered in MongoDB for this tenant
-    private_docs_cursor = db.documents.find({"organization_id": org_id, "access_level": "private"})
-    private_docs = await private_docs_cursor.to_list(length=100)
+    # --- STRICT ACCESS CONTROL & ROLE-BASED RELEVANCE ENFORCEMENT ---
+    # 1. Fetch all documents registered in MongoDB for this tenant to inspect role permissions
+    all_docs_cursor = db.documents.find({"organization_id": org_id})
+    all_docs = await all_docs_cursor.to_list(length=300)
     
-    # Extract private document titles and stems (e.g. "unit 2", "unit2", "unit2.pdf")
-    private_stems = []
-    for d in private_docs:
-        title = d.get("title", "").lower()
-        if title:
-            private_stems.append(title)
-            stem = title.rsplit(".", 1)[0]
-            if len(stem) >= 3:
-                private_stems.append(stem)
-                # Also handle spacing variations (e.g. "unit2" -> "unit 2")
-                private_stems.append(stem.replace(" ", ""))
+    accessible_doc_titles = set()
+    restricted_doc_titles = set()
+    restricted_stems = []
+
+    for d in all_docs:
+        title = d.get("title", "")
+        roles = d.get("allowed_roles")
+        # Determine if this document is accessible by the current user's role
+        if roles is not None and isinstance(roles, list) and len(roles) > 0:
+            is_allowed = (user_role in roles)
+        else:
+            # Backward compatibility with access_level
+            if d.get("access_level") == "public":
+                is_allowed = True
+            elif user_role == RoleEnum.ORG_ADMIN.value:
+                is_allowed = True
+            else:
+                is_allowed = False
+
+        if is_allowed:
+            accessible_doc_titles.add(title)
+        else:
+            restricted_doc_titles.add(title)
+            title_lower = title.lower()
+            if title_lower:
+                restricted_stems.append(title_lower)
+                stem = title_lower.rsplit(".", 1)[0]
+                if len(stem) >= 3:
+                    restricted_stems.append(stem)
+                    restricted_stems.append(stem.replace("_", " "))
+                    restricted_stems.append(stem.replace("-", " "))
+                    restricted_stems.append(stem.replace(" ", ""))
 
     # Evaluate query security and context relevance
     security_blocked_reason = None
     is_unavailable = False
     context_docs = []
 
-    if user_role == RoleEnum.SUPER_ADMIN:
+    if user_role == RoleEnum.SUPER_ADMIN.value:
         # Central Platform Admin: Search across all active tenant knowledge bases or a selected target organization
         if request.target_org_id and request.target_org_id != "all":
             search_namespaces = [request.target_org_id]
@@ -204,54 +225,72 @@ async def chat_with_agent_stream(
 
         # Rank all retrieved chunks across all namespaces
         all_matches.sort(key=lambda x: x[1], reverse=True)
-        # Select top relevant chunks with reasonable threshold
         context_docs = [doc for doc, score in all_matches[:6] if score >= 0.25]
         if not context_docs:
             is_unavailable = True
 
-    elif user_role == RoleEnum.ORG_ADMIN:
-        # Organization Admin: Search all public and private documents within their organization
+    elif user_role == RoleEnum.ORG_ADMIN.value:
+        # Organization Admin: Search all documents within their organization namespace
         all_matches = await asyncio.to_thread(
             vectorstore.similarity_search_with_score,
-            query_text, k=5
+            query_text, k=6
         )
         context_docs = [doc for doc, score in all_matches if score >= 0.25]
         if not context_docs:
             is_unavailable = True
 
     else:
-        # End User: Strict RBAC Document Isolation (Public only, private strictly forbidden)
-        mentions_private_doc = any(stem in query_lower for stem in private_stems if len(stem) >= 3)
-        mentions_private_terms = any(kw in query_lower for kw in ["private document", "private doc", "confidential document", "restricted document"])
+        # End Users & Custom Roles: Strict RBAC Document Role Isolation
+        mentions_restricted_doc = any(stem in query_lower for stem in restricted_stems if len(stem) >= 3)
+        mentions_restricted_terms = any(kw in query_lower for kw in [
+            "private document", "private doc", "confidential document", "restricted document", "secret document"
+        ])
 
-        if mentions_private_doc or mentions_private_terms:
+        if mentions_restricted_doc or (mentions_restricted_terms and restricted_doc_titles):
             security_blocked_reason = (
-                "🔒 **Access Restricted**: The requested information references a restricted private document. "
-                "End-user accounts are strictly prohibited from viewing or querying private organization records."
+                f"🔒 **Access Restricted**: The requested document or information is restricted for your role (`{user_role}`). "
+                f"Your account does not have permission to query this content."
             )
         else:
-            priv_matches = await asyncio.to_thread(
+            # Perform similarity search to evaluate matches
+            raw_matches = await asyncio.to_thread(
                 vectorstore.similarity_search_with_score,
-                query_text, k=1, filter={"access_level": "private"}
-            )
-            pub_matches = await asyncio.to_thread(
-                vectorstore.similarity_search_with_score,
-                query_text, k=4, filter={"access_level": "public"}
+                query_text, k=8
             )
 
-            priv_score = priv_matches[0][1] if priv_matches else 0.0
-            pub_score = pub_matches[0][1] if pub_matches else 0.0
-            
-            if priv_score >= 0.40 and (pub_score < 0.38 or priv_score > (pub_score + 0.12)):
-                source_name = priv_matches[0][0].metadata.get("source", "Private Document")
+            authorized_matches = []
+            restricted_matches = []
+
+            for doc, score in raw_matches:
+                source_file = doc.metadata.get("source", "")
+                chunk_roles = doc.metadata.get("allowed_roles")
+
+                # Verify role permission
+                if chunk_roles is not None and isinstance(chunk_roles, list) and len(chunk_roles) > 0:
+                    is_chunk_auth = (user_role in chunk_roles)
+                else:
+                    is_chunk_auth = (source_file in accessible_doc_titles) or (doc.metadata.get("access_level") == "public")
+
+                if is_chunk_auth:
+                    if score >= 0.28:
+                        authorized_matches.append((doc, score))
+                else:
+                    if score >= 0.38:
+                        restricted_matches.append((doc, score))
+
+            top_priv_score = restricted_matches[0][1] if restricted_matches else 0.0
+            top_pub_score = authorized_matches[0][1] if authorized_matches else 0.0
+
+            if top_priv_score >= 0.40 and (top_pub_score < 0.38 or top_priv_score > (top_pub_score + 0.12)):
+                blocked_source = restricted_matches[0][0].metadata.get("source", "Restricted Document")
                 security_blocked_reason = (
-                    f"🔒 **Access Restricted**: The requested information is contained in a private document (`{source_name}`). "
-                    "End-user accounts do not have permission to access private organization files."
+                    f"🔒 **Access Restricted**: The requested information is contained in a restricted document (`{blocked_source}`). "
+                    f"Users with role `{user_role}` do not have permission to access or query this document."
                 )
-            elif pub_score < 0.28:
+            elif not authorized_matches:
                 is_unavailable = True
             else:
-                context_docs = [doc for doc, score in pub_matches if score >= 0.28]
+                context_docs = [doc for doc, score in authorized_matches[:5]]
 
     # --- LLM CHAIN SETUP (Only used if not blocked or unavailable) ---
     system_prompt = (

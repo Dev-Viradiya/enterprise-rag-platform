@@ -809,7 +809,7 @@ export default function Dashboard() {
                 </p>
                 <p style={{ fontSize: '10.5px', color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <span style={{ width: '5px', height: '5px', borderRadius: '50%', background: isSuperAdmin ? '#6366f1' : isAdmin ? '#06b6d4' : '#10b981' }} />
-                  {isSuperAdmin ? 'Central Super Admin' : isAdmin ? 'Org Admin' : 'Member'}
+                  {isSuperAdmin ? 'Central Super Admin' : (user?.role ? user.role.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : 'Member')}
                 </p>
               </div>
               <ChevronDown style={{

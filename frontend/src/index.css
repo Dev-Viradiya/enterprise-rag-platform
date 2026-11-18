@@ -274,6 +274,26 @@ body {
   border-color: var(--color-border-strong);
 }
 
+/* === Form Inputs === */
+.input-field {
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--color-text-primary);
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 13.5px;
+  outline: none;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.input-field:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--color-accent-soft);
+}
+.input-field::placeholder {
+  color: var(--color-text-muted);
+}
+
 /* === Gradients & Badges === */
 .grad-brand {
   background: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
