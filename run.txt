@@ -1,0 +1,6 @@
+venv\Scripts\activate
+cd frontend
+npm run dev
+
+venv\Scripts\activate
+uvicorn main:app --reload --port 8000
